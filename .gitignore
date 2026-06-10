@@ -1,0 +1,9 @@
+.DS_Store
+checker_magenta_chartreuse.png
+node_modules/
+.env
+.env.*
+!.env.example
+projects.local.ts
+.aiops/
+.sandcastle/
