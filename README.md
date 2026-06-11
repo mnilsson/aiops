@@ -8,10 +8,12 @@ This repo is safe to publish publicly: organization-specific project allowlists 
 
 - Runs locally/manual only.
 - Uses GitLab and GitHub issues.
-- Processes max 4 issues per run.
+- Processes max 4 issues / Parent PRDs per run.
 - Prioritizes issues labelled `critical`, then oldest eligible issue.
-- Normal repos require `ready-for-agent`.
-- High-risk repos should require `ready-for-agent` and `agent-approved`.
+- Normal standalone issues require `ready-for-agent`.
+- High-risk standalone issues should require `ready-for-agent` and `agent-approved`.
+- PRD workflow uses ordinary Parent PRD issues and ordinary Slice Issues linked by aiops markers.
+- High-risk Parent PRDs require `agent-approved` in addition to `agent-to-issues` or `agent-implement-prd`.
 - Opens GitLab MRs or GitHub PRs for human review; never auto-merges.
 - On MR/PR creation, removes `ready-for-agent` and adds `agent-mr-opened`.
 - Labels created MRs/PRs with `agent-created`.
@@ -25,7 +27,7 @@ Create a private local config from the public template:
 cp projects.example.ts projects.local.ts
 ```
 
-Then edit `projects.local.ts` with your project allowlist, forge (`gitlab` or `github`), setup commands, verification commands, and risk level. Existing configs default to `gitlab`. This file is ignored by git and should not be committed.
+Then edit `projects.local.ts` with your project allowlist, forge (`gitlab` or `github`), setup commands, verification commands, and risk level. Existing configs default to `gitlab`. PRD workflow is enabled by default; set `prdWorkflow: false` for repos that should only use standalone issue mode. This file is ignored by git and should not be committed.
 
 ## Runtime state
 
@@ -43,12 +45,39 @@ npm run sandcastle:build-image
 npm run sandcastle
 ```
 
-To ask Sandcastle to inspect failed GitLab CI pipelines / GitHub checks or resolve MR/PR merge conflicts and push focused fixes, use an MR/PR labelled `agent-created` and/or `agent-fix-ci`, then run:
+To decompose a Parent PRD into ordered Slice Issues, label the Parent PRD `agent-to-issues`, then run:
+
+```bash
+npm run sandcastle:to-issues-prd
+```
+
+To implement Slice Issues for each eligible Parent PRD, label the Parent PRD `agent-implement-prd`, then run:
+
+```bash
+npm run sandcastle:implement-prd
+```
+
+The PRD implementation run keeps taking the next valid Slice Issue for each selected Parent PRD until the PRD is complete, a slice is blocked, verification fails, or the safety iteration cap is reached. The PRD workflow opens one draft MR/PR after the first implemented slice, keeps updating that same Review Request, and marks it `agent-ready-for-review` when all slices are implemented.
+
+To ask Sandcastle to inspect failed GitLab CI pipelines / GitHub checks or resolve MR/PR merge conflicts and push focused fixes, use a non-draft MR/PR labelled `agent-created` and/or `agent-fix-ci`, then run:
 
 ```bash
 npm run sandcastle:fix-failed-review-requests
 ```
 
 GitHub fork PRs are skipped because the fixer pushes back to the existing PR branch.
+
+## PRD workflow labels
+
+Create these labels in managed repositories before using PRD workflow:
+
+- `agent-to-issues` — decompose a Parent PRD into Slice Issues.
+- `agent-implement-prd` — implement the next Slice Issue for a Parent PRD.
+- `agent-prd-in-progress` — a shared PRD Review Request exists or is being worked.
+- `agent-ready-for-review` — all slices are implemented and the shared Review Request is ready.
+- `agent-blocked` — aiops cannot safely continue without human intervention.
+- `agent-slice` — marks ordinary issues created as Slice Issues.
+- `agent-slice-implemented` — marks a Slice Issue implemented on the shared branch.
+- `agent-created` — marks aiops-created Slice Issues and Review Requests.
 
 The default Docker image is shared across all managed project workspaces as `sandcastle:aiops`. The image includes both `glab` and `gh`; authenticate both CLIs on the host before managing private projects. GitHub sandbox auth is mounted from `GH_CONFIG_DIR` or common `gh` config directories when present.

@@ -18,6 +18,8 @@ export type SandcastleProject = {
   forge?: Forge;
   /** "gitlab-quality" is only supported for GitLab projects. */
   baselineMode?: BaselineMode;
+  /** Defaults to true. Disable for repos whose tracker/API behavior is not compatible with PRD workflow. */
+  prdWorkflow?: boolean;
   sandboxImage?: string;
 };
 
