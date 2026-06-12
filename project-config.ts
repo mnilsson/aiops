@@ -5,6 +5,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 export type Forge = "gitlab" | "github";
 export type ProjectRisk = "normal" | "high";
 export type BaselineMode = "local" | "gitlab-quality";
+export type AuthorScope = "self" | "any";
 
 export type SandcastleProject = {
   repo: string;
@@ -12,6 +13,10 @@ export type SandcastleProject = {
   defaultBranch: string;
   risk: ProjectRisk;
   requiredLabels: string[];
+  /** Defaults to "self": only workflow items authored by the authenticated CLI user are eligible. */
+  authorScope?: AuthorScope;
+  /** Deprecated alias for authorScope. */
+  issueAuthorScope?: AuthorScope;
   setupCommands: string[];
   verifyCommands: string[];
   /** Defaults to "gitlab" for existing configs. */

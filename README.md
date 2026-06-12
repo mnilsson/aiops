@@ -9,6 +9,7 @@ This repo is safe to publish publicly: organization-specific project allowlists 
 - Runs locally/manual only.
 - Uses GitLab and GitHub issues.
 - Processes max 4 issues / Parent PRDs per run.
+- By default, only processes workflow items authored by the authenticated CLI user running aiops.
 - Prioritizes issues labelled `critical`, then oldest eligible issue.
 - Normal standalone issues require `ready-for-agent`.
 - High-risk standalone issues should require `ready-for-agent` and `agent-approved`.
@@ -27,7 +28,7 @@ Create a private local config from the public template:
 cp projects.example.ts projects.local.ts
 ```
 
-Then edit `projects.local.ts` with your project allowlist, forge (`gitlab` or `github`), setup commands, verification commands, and risk level. Existing configs default to `gitlab`. PRD workflow is enabled by default; set `prdWorkflow: false` for repos that should only use standalone issue mode. This file is ignored by git and should not be committed.
+Then edit `projects.local.ts` with your project allowlist, forge (`gitlab` or `github`), setup commands, verification commands, and risk level. Existing configs default to `gitlab`. Workflow item selection defaults to `authorScope: "self"`, meaning aiops only handles issues, Parent PRDs, Slice Issues, and Review Requests authored by the authenticated `glab`/`gh` user running it; set `authorScope: "any"` only for projects where this runner may handle workflow items from any author. PRD workflow is enabled by default; set `prdWorkflow: false` for repos that should only use standalone issue mode. This file is ignored by git and should not be committed.
 
 ## Runtime state
 

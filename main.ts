@@ -88,6 +88,13 @@ type CandidateIssue = TrackedIssue & {
   forge: Forge;
 };
 
+type AuthorScope = NonNullable<SandcastleProject["authorScope"]>;
+
+type IssueListOptions = {
+  all?: boolean;
+  authorScope?: AuthorScope;
+};
+
 type VerifyResult = {
   ok: boolean;
   output: string;
@@ -254,6 +261,67 @@ function projectForge(project: SandcastleProject): Forge {
 
 function forgeName(forge: Forge): string {
   return forge === "github" ? "GitHub" : "GitLab";
+}
+
+type CurrentGitLabUser = { username?: string };
+const currentWorkflowAuthorCache = new Map<string, string>();
+
+function workflowAuthorScope(project: SandcastleProject): AuthorScope {
+  return project.authorScope ?? project.issueAuthorScope ?? "self";
+}
+
+function parseRemoteHost(remoteUrl: string): string | undefined {
+  try {
+    const url = new URL(remoteUrl);
+    return url.hostname || undefined;
+  } catch {
+    return remoteUrl.match(/^[^@\s]+@([^:/\s]+)[:/]/)?.[1];
+  }
+}
+
+function parseRepoHost(repo: string): string | undefined {
+  try {
+    const url = new URL(repo);
+    return url.hostname || undefined;
+  } catch {
+    const parts = repo.split("/");
+    return parts.length > 2 && parts[0]?.includes(".") ? parts[0] : undefined;
+  }
+}
+
+function projectHost(project: SandcastleProject): string | undefined {
+  return parseRepoHost(project.repo) ?? parseRemoteHost(project.remoteUrl);
+}
+
+function currentWorkflowAuthor(project: SandcastleProject): string | undefined {
+  if (workflowAuthorScope(project) === "any") return undefined;
+
+  const forge = projectForge(project);
+  const host = projectHost(project) ?? "default";
+  const key = `${forge}:${host}`;
+  const cached = currentWorkflowAuthorCache.get(key);
+  if (cached) return cached;
+
+  const hostArg = host === "default" ? "" : ` --hostname ${shellQuote(host)}`;
+  const raw = forge === "github"
+    ? sh(`gh api${hostArg} user --jq .login`)
+    : sh(`glab api user${hostArg}`);
+  const author = forge === "github"
+    ? raw.trim()
+    : parseJsonObject<CurrentGitLabUser>(raw)?.username?.trim();
+
+  if (!author) {
+    throw new Error(`Could not determine authenticated ${forgeName(forge)} user for ${project.repo}. Set authorScope: "any" for this project if aiops should process workflow items from any author.`);
+  }
+
+  currentWorkflowAuthorCache.set(key, author);
+  return author;
+}
+
+function workflowAuthorArgs(project: SandcastleProject, authorScope: IssueListOptions["authorScope"] = workflowAuthorScope(project)): string[] {
+  if (authorScope === "any") return [];
+  const author = currentWorkflowAuthor(project);
+  return author ? [`--author ${shellQuote(author)}`] : [];
 }
 
 function githubConfigHostPath(): string | undefined {
@@ -440,6 +508,7 @@ function listGitLabIssues(project: SandcastleProject): CandidateIssue[] {
     `-R ${shellQuote(project.repo)}`,
     "--output json",
     "--per-page 100",
+    ...workflowAuthorArgs(project),
     ...project.requiredLabels.map((label) => `--label ${shellQuote(label)}`),
     `--not-label ${shellQuote(IN_PROGRESS_LABEL)}`,
   ];
@@ -458,6 +527,7 @@ function listGitHubIssues(project: SandcastleProject): CandidateIssue[] {
     "--state open",
     "--limit 100",
     "--json number,title,body,labels,createdAt,url,state",
+    ...workflowAuthorArgs(project),
     ...project.requiredLabels.map((label) => `--label ${shellQuote(label)}`),
   ];
   const raw = sh(`gh ${args.join(" ")}`);
@@ -482,22 +552,24 @@ function listIssues(project: SandcastleProject): CandidateIssue[] {
   return projectForge(project) === "github" ? listGitHubIssues(project) : listGitLabIssues(project);
 }
 
-function listGitLabIssuesWithLabel(project: SandcastleProject, label: string, options: { all?: boolean } = {}): CandidateIssue[] {
+function listGitLabIssuesWithLabel(project: SandcastleProject, label: string, options: IssueListOptions = {}): CandidateIssue[] {
   const args = [
     "issue list",
     `-R ${shellQuote(project.repo)}`,
     "--output json",
     "--per-page 100",
     options.all ? "--all" : undefined,
+    ...workflowAuthorArgs(project, options.authorScope),
     `--label ${shellQuote(label)}`,
   ].filter(Boolean);
   const raw = sh(`glab ${args.join(" ")}`);
   return (JSON.parse(raw) as GitLabIssue[]).map((issue) => toCandidateIssue(project, issue));
 }
 
-function listGitHubIssuesWithLabel(project: SandcastleProject, label: string, options: { all?: boolean } = {}): CandidateIssue[] {
+function listGitHubIssuesWithLabel(project: SandcastleProject, label: string, options: IssueListOptions = {}): CandidateIssue[] {
+  const authorArgs = workflowAuthorArgs(project, options.authorScope).join(" ");
   const raw = sh(
-    `gh issue list -R ${shellQuote(project.repo)} --state ${options.all ? "all" : "open"} --limit 200 --label ${shellQuote(label)} --json number,title,body,labels,createdAt,url,state`,
+    `gh issue list -R ${shellQuote(project.repo)} --state ${options.all ? "all" : "open"} --limit 200 --label ${shellQuote(label)} --json number,title,body,labels,createdAt,url,state ${authorArgs}`.trim(),
   );
   return (JSON.parse(raw) as GitHubIssue[]).map((issue) =>
     toCandidateIssue(project, {
@@ -513,7 +585,7 @@ function listGitHubIssuesWithLabel(project: SandcastleProject, label: string, op
   );
 }
 
-function listIssuesWithLabel(project: SandcastleProject, label: string, options: { all?: boolean } = {}): CandidateIssue[] {
+function listIssuesWithLabel(project: SandcastleProject, label: string, options: IssueListOptions = {}): CandidateIssue[] {
   return projectForge(project) === "github"
     ? listGitHubIssuesWithLabel(project, label, options)
     : listGitLabIssuesWithLabel(project, label, options);
@@ -837,22 +909,44 @@ function createIssue(project: SandcastleProject, title: string, body: string, la
   return toCandidateIssue(project, JSON.parse(raw) as GitLabIssue);
 }
 
-function listPrdSlices(project: SandcastleProject, parent: CandidateIssue): PrdSliceIssue[] {
+function listPrdSliceCandidates(project: SandcastleProject, parent: CandidateIssue, options: IssueListOptions = {}): CandidateIssue[] {
   const expectedParent = parentRef(project, parent.iid);
-  return listIssuesWithLabel(project, AGENT_SLICE_LABEL, { all: true })
+  return listIssuesWithLabel(project, AGENT_SLICE_LABEL, { ...options, all: true })
     .map((issue) => issue.description === undefined ? getIssue(project, issue.iid) : issue)
     .filter((issue) => parseParentRef(issue.description) === expectedParent)
+    .sort((a, b) => a.iid - b.iid);
+}
+
+function listPrdSlices(project: SandcastleProject, parent: CandidateIssue, options: IssueListOptions = {}): PrdSliceIssue[] {
+  return listPrdSliceCandidates(project, parent, options)
     .map((issue) => ({ ...issue, order: parseSliceOrder(issue.description) ?? 0 }))
     .filter((issue): issue is PrdSliceIssue => issue.order > 0)
     .sort((a, b) => a.order - b.order || a.iid - b.iid);
 }
 
-function listInvalidPrdSlices(project: SandcastleProject, parent: CandidateIssue): CandidateIssue[] {
-  const expectedParent = parentRef(project, parent.iid);
-  return listIssuesWithLabel(project, AGENT_SLICE_LABEL, { all: true })
-    .map((issue) => issue.description === undefined ? getIssue(project, issue.iid) : issue)
-    .filter((issue) => parseParentRef(issue.description) === expectedParent)
+function listInvalidPrdSlices(project: SandcastleProject, parent: CandidateIssue, options: IssueListOptions = {}): CandidateIssue[] {
+  return listPrdSliceCandidates(project, parent, options)
     .filter((issue) => parseSliceOrder(issue.description) === undefined);
+}
+
+function listForeignPrdSliceCandidates(project: SandcastleProject, parent: CandidateIssue): CandidateIssue[] {
+  if (workflowAuthorScope(project) === "any") return [];
+  const owned = new Set(listPrdSliceCandidates(project, parent).map((issue) => issue.iid));
+  return listPrdSliceCandidates(project, parent, { authorScope: "any" })
+    .filter((issue) => !owned.has(issue.iid));
+}
+
+function foreignPrdSlicesMessage(project: SandcastleProject, parent: CandidateIssue, foreign: CandidateIssue[]): string {
+  const refs = foreign.slice(0, 10).map((issue) => issueRef(project, issue.iid)).join(", ");
+  const suffix = foreign.length > 10 ? `, and ${foreign.length - 10} more` : "";
+  return `aiops found ${foreign.length} Slice Issue(s) linked to this Parent PRD that were not authored by the authenticated CLI user: ${refs}${suffix}. By default aiops will not handle workflow items from other authors. Remove or recreate those Slice Issues as the running user, or set \`authorScope: "any"\` for this project if that is intentional.`;
+}
+
+function blockIfForeignPrdSlices(project: SandcastleProject, parent: CandidateIssue, removeLabels: string[]): boolean {
+  const foreign = listForeignPrdSliceCandidates(project, parent);
+  if (foreign.length === 0) return false;
+  blockPrdWorkflow(project, parent, foreignPrdSlicesMessage(project, parent, foreign), { removeLabels });
+  return true;
 }
 
 function buildParentSliceSection(slices: PrdSliceIssue[]): string {
@@ -968,14 +1062,27 @@ function sandboxHooks(project: SandcastleProject) {
 }
 
 function listOpenMergeRequests(project: SandcastleProject): GitLabMergeRequest[] {
-  const raw = sh(`glab mr list -R ${shellQuote(project.repo)} --output json --per-page 100`);
+  const args = [
+    "mr list",
+    `-R ${shellQuote(project.repo)}`,
+    "--output json",
+    "--per-page 100",
+    ...workflowAuthorArgs(project),
+  ];
+  const raw = sh(`glab ${args.join(" ")}`);
   return JSON.parse(raw) as GitLabMergeRequest[];
 }
 
 function listOpenPullRequests(project: SandcastleProject): GitHubPullRequest[] {
-  const raw = sh(
-    `gh pr list -R ${shellQuote(project.repo)} --state open --limit 100 --json number,title,headRefName,baseRefName,headRefOid,isCrossRepository,isDraft,labels,body,state,url,mergeStateStatus,mergeable`,
-  );
+  const args = [
+    "pr list",
+    `-R ${shellQuote(project.repo)}`,
+    "--state open",
+    "--limit 100",
+    "--json number,title,headRefName,baseRefName,headRefOid,isCrossRepository,isDraft,labels,body,state,url,mergeStateStatus,mergeable",
+    ...workflowAuthorArgs(project),
+  ];
+  const raw = sh(`gh ${args.join(" ")}`);
   return JSON.parse(raw) as GitHubPullRequest[];
 }
 
@@ -1020,15 +1127,16 @@ function getGitHubPullRequest(project: SandcastleProject, number: number): GitHu
 function listPrdReviewRequests(project: SandcastleProject, parent: CandidateIssue, branch: string): ReviewRequest[] {
   const expectedParent = parentRef(project, parent.iid);
   if (projectForge(project) === "github") {
+    const authorArgs = workflowAuthorArgs(project).join(" ");
     const raw = sh(
-      `gh pr list -R ${shellQuote(project.repo)} --state all --limit 100 --head ${shellQuote(branch)} --json number,title,headRefName,baseRefName,isDraft,labels,body,state,url`,
+      `gh pr list -R ${shellQuote(project.repo)} --state all --limit 100 --head ${shellQuote(branch)} --json number,title,headRefName,baseRefName,isDraft,labels,body,state,url ${authorArgs}`.trim(),
     );
     return parseJsonArray<GitHubPullRequest>(raw)
       .map(githubReviewRequest)
       .filter((pr) => pr.branch === branch && parseParentRef(pr.body) === expectedParent);
   }
 
-  const raw = sh(`glab mr list -R ${shellQuote(project.repo)} --all --source-branch ${shellQuote(branch)} --output json --per-page 100`);
+  const raw = sh(`glab mr list -R ${shellQuote(project.repo)} --all --source-branch ${shellQuote(branch)} --output json --per-page 100 ${workflowAuthorArgs(project).join(" ")}`.trim());
   return parseJsonArray<GitLabMergeRequest>(raw)
     .map((mr) => getMergeRequest(project, mr.iid) ?? mr)
     .map((mr) => gitlabReviewRequest(project, mr))
@@ -1537,6 +1645,11 @@ async function runToIssuesPrd() {
 
   for (const parent of candidates) {
     try {
+      if (blockIfForeignPrdSlices(parent.project, parent, [PRD_TO_ISSUES_LABEL])) {
+        console.log(color.yellow(`- ${parent.repo}#${parent.iid}: blocked due to Slice Issues from other authors`));
+        continue;
+      }
+
       const invalid = listInvalidPrdSlices(parent.project, parent);
       const existing = listPrdSlices(parent.project, parent);
       if (invalid.length > 0) {
@@ -1645,6 +1758,10 @@ async function implementParentPrd(parent: CandidateIssue, workspace: string, bas
   let warnedInvalidSlices = false;
 
   for (let iteration = 1; iteration <= MAX_PRD_SLICES; iteration++) {
+    if (blockIfForeignPrdSlices(project, parent, [PRD_IMPLEMENT_LABEL])) {
+      return { parent, commits: totalCommits };
+    }
+
     let slices = listPrdSlices(project, parent);
     const invalid = listInvalidPrdSlices(project, parent);
     if (invalid.length > 0 && !warnedInvalidSlices) {

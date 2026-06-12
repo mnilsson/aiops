@@ -8,6 +8,8 @@ export const projects: SandcastleProject[] = [
     defaultBranch: "main",
     risk: "normal",
     requiredLabels: NORMAL_LABELS,
+    // Defaults to "self". Set to "any" only if aiops may handle workflow items from other authors.
+    // authorScope: "any",
     setupCommands: ["npm ci"],
     verifyCommands: ["npm test"],
   },
