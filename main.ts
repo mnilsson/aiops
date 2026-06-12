@@ -1,6 +1,6 @@
 import * as sandcastle from "@ai-hero/sandcastle";
 import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -223,6 +223,7 @@ const AGENT_APPROVED_LABEL = "agent-approved";
 const AGENT_SLICE_LABEL = "agent-slice";
 const AGENT_SLICE_IMPLEMENTED_LABEL = "agent-slice-implemented";
 const MAX_PRD_SLICES = 12;
+const AGENT_OUTPUT_TAIL_BYTES = 64 * 1024;
 const PRD_PARENT_MARKER_NAME = "aiops-parent-prd";
 const PRD_PARENT_MARKER = /<!--\s*aiops-parent-prd:\s*([^>]+?)\s*-->/i;
 const PRD_SLICE_ORDER_MARKER = /<!--\s*aiops-slice-order:\s*(\d+)\s*-->/i;
@@ -416,25 +417,70 @@ function renderPromptFile(path: string, args: Record<string, string>): string {
   return template.replace(/\{\{([A-Z0-9_]+)\}\}/g, (_match, key: string) => args[key] ?? "");
 }
 
-function runAgentPrompt(prompt: string, options: { cwd?: string } = {}): string {
+function appendOutputTail(current: string, chunk: string): string {
+  const combined = current + chunk;
+  if (Buffer.byteLength(combined, "utf8") <= AGENT_OUTPUT_TAIL_BYTES) return combined;
+  return Buffer.from(combined, "utf8").subarray(-AGENT_OUTPUT_TAIL_BYTES).toString("utf8");
+}
+
+async function runAgentPrompt(prompt: string, options: { cwd?: string } = {}): Promise<string> {
   const command = AGENT.buildPrintCommand({ prompt, dangerouslySkipPermissions: false });
-  const raw = execFileSync(command.command, {
+  const child = spawn(command.command, {
     cwd: options.cwd,
-    encoding: "utf8",
     env: { ...process.env, ...AGENT.env },
-    input: command.stdin,
     shell: "/bin/bash",
     stdio: ["pipe", "pipe", "pipe"],
   });
+
+  child.stdin.end(command.stdin);
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+
   const text: string[] = [];
   const results: string[] = [];
-  for (const line of raw.split(/\r?\n/)) {
-    for (const event of AGENT.parseStreamLine(line)) {
-      if (event.type === "text") text.push(event.text);
-      else if (event.type === "result") results.push(event.result);
+  let stdoutRemainder = "";
+  let stdoutTail = "";
+  let stderrTail = "";
+  let streamError: Error | undefined;
+
+  const parseLine = (line: string) => {
+    try {
+      for (const event of AGENT.parseStreamLine(line)) {
+        if (event.type === "text") text.push(event.text);
+        else if (event.type === "result") results.push(event.result);
+      }
+    } catch (error) {
+      streamError = error instanceof Error ? error : new Error(String(error));
+      child.kill();
     }
+  };
+
+  child.stdout.on("data", (chunk: string) => {
+    stdoutTail = appendOutputTail(stdoutTail, chunk);
+    const lines = (stdoutRemainder + chunk).split(/\r?\n/);
+    stdoutRemainder = lines.pop() ?? "";
+    for (const line of lines) parseLine(line);
+  });
+  child.stderr.on("data", (chunk: string) => {
+    stderrTail = appendOutputTail(stderrTail, chunk);
+  });
+
+  const exitCode = await new Promise<number | null>((resolve, reject) => {
+    child.on("error", reject);
+    child.on("close", resolve);
+  });
+
+  if (stdoutRemainder) parseLine(stdoutRemainder);
+  if (streamError) throw streamError;
+  if (exitCode !== 0) {
+    throw new Error([
+      `Agent command failed with exit status ${exitCode ?? "unknown"}: ${command.command}`,
+      stderrTail.trim() ? `stderr tail:\n${stderrTail.trim()}` : "",
+      stdoutTail.trim() ? `stdout tail:\n${stdoutTail.trim()}` : "",
+    ].filter(Boolean).join("\n\n"));
   }
-  return (results.at(-1) ?? text.join("") ?? raw).trim();
+
+  return (results.at(-1) ?? text.join("")).trim();
 }
 
 function parseTaggedJson<T>(raw: string, tag: string): T {
@@ -1616,7 +1662,7 @@ function validateSlicePlans(parent: CandidateIssue, value: unknown): SlicePlan[]
   });
 }
 
-function generateSlicePlans(parent: CandidateIssue): SlicePlan[] {
+async function generateSlicePlans(parent: CandidateIssue): Promise<SlicePlan[]> {
   const prompt = renderPromptFile(join(PROMPT_DIR, "to-issues-prd-prompt.md"), {
     REPO: parent.repo,
     ISSUE_TRACKER: forgeName(parent.forge),
@@ -1625,7 +1671,7 @@ function generateSlicePlans(parent: CandidateIssue): SlicePlan[] {
     PARENT_PRD_VIEW_COMMAND: issueViewCommand(parent),
     MAX_SLICES: String(MAX_PRD_SLICES),
   });
-  const output = runAgentPrompt(prompt);
+  const output = await runAgentPrompt(prompt);
   const parsed = parseTaggedJson<unknown>(output, "slices");
   return validateSlicePlans(parent, parsed);
 }
@@ -1670,7 +1716,7 @@ async function runToIssuesPrd() {
         continue;
       }
 
-      const plans = generateSlicePlans(parent);
+      const plans = await generateSlicePlans(parent);
       for (const [index, plan] of plans.entries()) {
         const order = index + 1;
         createIssue(
