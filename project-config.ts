@@ -7,6 +7,23 @@ export type ProjectRisk = "normal" | "high";
 export type BaselineMode = "local" | "gitlab-quality";
 export type AuthorScope = "self" | "any";
 
+export type SandboxBaseImageFromRepo = {
+  /** Relative path to the repo Dockerfile to build from. Defaults to "Dockerfile". */
+  dockerfile?: string;
+  /** Relative Docker build context. Defaults to the repo root. */
+  context?: string;
+  /** Dockerfile stage/target to build as the sandbox base, e.g. "base" or "dev". */
+  stage?: string;
+  /** Only defaultBranch is supported so issue/MR branches cannot alter their own sandbox base. */
+  ref?: "defaultBranch";
+  /** Docker build args passed while building the repo stage. Do not put secrets here. */
+  buildArgs?: Record<string, string>;
+  /** Final sandbox image tag. Defaults to aiops/<repo-slug>:sandbox. */
+  imageName?: string;
+  /** Intermediate repo-stage image tag. Defaults to aiops/<repo-slug>:repo-base. */
+  baseImageName?: string;
+};
+
 export type SandcastleProject = {
   repo: string;
   remoteUrl: string;
@@ -25,7 +42,10 @@ export type SandcastleProject = {
   baselineMode?: BaselineMode;
   /** Defaults to true. Disable for repos whose tracker/API behavior is not compatible with PRD workflow. */
   prdWorkflow?: boolean;
+  /** Explicit prebuilt sandbox image. Takes precedence over sandboxBaseImageFromRepo. */
   sandboxImage?: string;
+  /** Build a project-specific sandbox image from a trusted repo Dockerfile/stage. */
+  sandboxBaseImageFromRepo?: SandboxBaseImageFromRepo;
 };
 
 export const NORMAL_LABELS = ["ready-for-agent"];

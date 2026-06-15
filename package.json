@@ -10,6 +10,7 @@
     "sandcastle:implement-prd": "tsx main.ts implement-prd",
     "sandcastle:fix-failed-review-requests": "tsx main.ts fix-failed-review-requests",
     "sandcastle:build-image": "sandcastle docker build-image --image-name sandcastle:aiops --dockerfile Dockerfile",
+    "sandcastle:build-project-images": "tsx main.ts build-sandbox-images",
     "check": "tsc --noEmit"
   },
   "devDependencies": {

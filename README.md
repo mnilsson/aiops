@@ -30,12 +30,26 @@ cp projects.example.ts projects.local.ts
 
 Then edit `projects.local.ts` with your project allowlist, forge (`gitlab` or `github`), setup commands, verification commands, and risk level. Existing configs default to `gitlab`. Workflow item selection defaults to `authorScope: "self"`, meaning aiops only handles issues, Parent PRDs, Slice Issues, and Review Requests authored by the authenticated `glab`/`gh` user running it; set `authorScope: "any"` only for projects where this runner may handle workflow items from any author. PRD workflow is enabled by default; set `prdWorkflow: false` for repos that should only use standalone issue mode. This file is ignored by git and should not be committed.
 
+If a repo needs its own dependency base, configure `sandboxBaseImageFromRepo`. aiops will build the named Dockerfile stage from the repo's trusted `defaultBranch`, tag it as an intermediate base, then build a sandbox image with the aiops tooling layer on top:
+
+```ts
+sandboxBaseImageFromRepo: {
+  dockerfile: "Dockerfile",
+  stage: "base", // or "dev"; omit to use the Dockerfile's final image
+  context: ".",
+  ref: "defaultBranch",
+}
+```
+
+Use `sandboxImage` instead when you already have a reviewed prebuilt sandbox image.
+
 ## Runtime state
 
 Ignored runtime state lives under:
 
 - `projects.local.ts`
 - `.aiops/workspaces/`
+- `.aiops/sandbox-images/`
 
 ## Run
 
@@ -43,6 +57,8 @@ Ignored runtime state lives under:
 npm install
 npm run check
 npm run sandcastle:build-image
+# Optional: prebuild project-specific sandbox images configured with sandboxBaseImageFromRepo.
+npm run sandcastle:build-project-images
 npm run sandcastle
 ```
 
@@ -81,4 +97,4 @@ Create these labels in managed repositories before using PRD workflow:
 - `agent-slice-implemented` — marks a Slice Issue implemented on the shared branch.
 - `agent-created` — marks aiops-created Slice Issues and Review Requests.
 
-The default Docker image is shared across all managed project workspaces as `sandcastle:aiops`. The image includes both `glab` and `gh`; authenticate both CLIs on the host before managing private projects. GitHub sandbox auth is mounted from `GH_CONFIG_DIR` or common `gh` config directories when present.
+The default Docker image is shared across all managed project workspaces as `sandcastle:aiops`. Project configs can override it with `sandboxImage` or build a derived image with `sandboxBaseImageFromRepo`. Derived images currently support Debian/Ubuntu-style `apt-get` bases and Alpine `apk` bases; distroless/minimal bases should use a dedicated prebuilt `sandboxImage`. The image includes both `glab` and `gh`; authenticate both CLIs on the host before managing private projects. GitHub sandbox auth is mounted from `GH_CONFIG_DIR` or common `gh` config directories when present.

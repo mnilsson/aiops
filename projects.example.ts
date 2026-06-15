@@ -12,6 +12,14 @@ export const projects: SandcastleProject[] = [
     // authorScope: "any",
     setupCommands: ["npm ci"],
     verifyCommands: ["npm test"],
+    // Optional: build the sandbox image from a trusted Dockerfile/stage on defaultBranch,
+    // then add the aiops tooling layer (pi, gh, glab, git, bash, etc.) on top.
+    // sandboxBaseImageFromRepo: {
+    //   dockerfile: "Dockerfile",
+    //   stage: "base",
+    //   context: ".",
+    //   ref: "defaultBranch",
+    // },
   },
   {
     forge: "github",
