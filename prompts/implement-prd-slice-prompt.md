@@ -11,6 +11,8 @@ Shared Review Request: {{REVIEW_REQUEST_URL}}
 # RULES
 
 - Only implement the current Slice Issue.
+- Start from the latest `origin/{{BRANCH}}` state for `{{BRANCH}}` when it exists; do not build on stale local-only branch state.
+- Before editing, confirm `git status --short` is clean; if it is not clean, stop and report the blocker.
 - Keep the Parent PRD context in mind, but do not implement later slices.
 - Pull full Parent PRD context with `{{PARENT_PRD_VIEW_COMMAND}}`.
 - Pull full current Slice Issue context with `{{SLICE_ISSUE_VIEW_COMMAND}}`.

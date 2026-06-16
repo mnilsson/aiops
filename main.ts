@@ -2135,6 +2135,124 @@ function ensureLocalBranchFromRemote(cwd: string, branch: string): void {
   if (commandFailed(existsLocal)) sh(`git branch ${shellQuote(branch)} ${shellQuote(`origin/${branch}`)}`, { cwd, allowFailure: true });
 }
 
+type GitWorktree = {
+  path: string;
+  branch?: string;
+};
+
+function parseGitWorktrees(raw: string): GitWorktree[] {
+  const worktrees: GitWorktree[] = [];
+  let current: GitWorktree | undefined;
+
+  for (const line of raw.split("\n")) {
+    if (line.startsWith("worktree ")) {
+      if (current) worktrees.push(current);
+      current = { path: line.slice("worktree ".length).trim() };
+    } else if (current && line.startsWith("branch refs/heads/")) {
+      current.branch = line.slice("branch refs/heads/".length).trim();
+    }
+  }
+
+  if (current) worktrees.push(current);
+  return worktrees;
+}
+
+function gitWorktrees(cwd: string): GitWorktree[] {
+  const raw = sh("git worktree list --porcelain", { cwd, allowFailure: true });
+  return commandFailed(raw) ? [] : parseGitWorktrees(raw);
+}
+
+function isPathInside(parent: string, child: string): boolean {
+  const rel = relative(resolve(parent), resolve(child));
+  return rel === "" || (!!rel && !rel.startsWith("..") && !isAbsolute(rel));
+}
+
+function gitStatusShort(cwd: string): VerifyResult {
+  const output = sh("git status --short", { cwd, allowFailure: true }).trim();
+  return commandFailed(output) ? { ok: false, output } : { ok: output.length === 0, output };
+}
+
+function refExists(cwd: string, ref: string): boolean {
+  return !commandFailed(sh(`git rev-parse --verify --quiet ${shellQuote(ref)}`, { cwd, allowFailure: true }));
+}
+
+function preparePrdBranchForSlice(project: SandcastleProject, cwd: string, branch: string): VerifyResult {
+  const managedWorktreesDir = join(cwd, ".sandcastle", "worktrees");
+
+  for (const worktree of gitWorktrees(cwd).filter((entry) => entry.branch === branch)) {
+    const status = gitStatusShort(worktree.path);
+    if (!status.ok) {
+      return {
+        ok: false,
+        output: `PRD branch ${branch} has local changes in ${worktree.path}:\n${status.output}`,
+      };
+    }
+
+    if (!isPathInside(managedWorktreesDir, worktree.path)) {
+      return {
+        ok: false,
+        output: `PRD branch ${branch} is checked out in non-aiops worktree ${worktree.path}; refusing to reset it.`,
+      };
+    }
+
+    const remove = sh(`git worktree remove --force ${shellQuote(worktree.path)}`, { cwd, allowFailure: true });
+    if (commandFailed(remove)) {
+      return { ok: false, output: `Could not remove clean aiops worktree for ${branch}:\n${remove.trim()}` };
+    }
+  }
+
+  const fetch = sh("git fetch --prune origin", { cwd, allowFailure: true });
+  if (commandFailed(fetch)) return { ok: false, output: `Could not fetch latest origin state:\n${fetch.trim()}` };
+
+  const branchRef = `refs/remotes/origin/${branch}`;
+  const defaultRef = `refs/remotes/origin/${project.defaultBranch}`;
+  const startRef = refExists(cwd, branchRef) ? branchRef : defaultRef;
+  if (!refExists(cwd, startRef)) return { ok: false, output: `Could not find ${startRef} after fetching origin.` };
+
+  const localRef = `refs/heads/${branch}`;
+  const sync = refExists(cwd, localRef)
+    ? sh(`git branch -f ${shellQuote(branch)} ${shellQuote(startRef)}`, { cwd, allowFailure: true })
+    : sh(`git branch ${shellQuote(branch)} ${shellQuote(startRef)}`, { cwd, allowFailure: true });
+
+  if (commandFailed(sync)) return { ok: false, output: `Could not sync local PRD branch ${branch} to ${startRef}:\n${sync.trim()}` };
+
+  return { ok: true, output: `Synced ${branch} to ${startRef}.` };
+}
+
+function resetCleanWorktreeToLatestOrigin(project: SandcastleProject, cwd: string, branch: string): VerifyResult {
+  const initialStatus = gitStatusShort(cwd);
+  if (!initialStatus.ok) {
+    return {
+      ok: false,
+      output: `Worktree has local changes before starting Slice Issue work:\n${initialStatus.output}`,
+    };
+  }
+
+  const fetch = sh("git fetch --prune origin", { cwd, allowFailure: true });
+  if (commandFailed(fetch)) return { ok: false, output: `Could not fetch latest origin state:\n${fetch.trim()}` };
+
+  const branchRef = `refs/remotes/origin/${branch}`;
+  const defaultRef = `refs/remotes/origin/${project.defaultBranch}`;
+  const startRef = refExists(cwd, branchRef) ? branchRef : defaultRef;
+  if (!refExists(cwd, startRef)) return { ok: false, output: `Could not find ${startRef} after fetching origin.` };
+
+  const reset = sh(`git reset --hard ${shellQuote(startRef)}`, { cwd, allowFailure: true });
+  if (commandFailed(reset)) return { ok: false, output: `Could not reset ${branch} to ${startRef}:\n${reset.trim()}` };
+
+  const clean = sh("git clean -fd", { cwd, allowFailure: true });
+  if (commandFailed(clean)) return { ok: false, output: `Could not clean ${branch} after reset:\n${clean.trim()}` };
+
+  const finalStatus = gitStatusShort(cwd);
+  if (!finalStatus.ok) {
+    return {
+      ok: false,
+      output: `Worktree still has local changes after resetting ${branch} to ${startRef}:\n${finalStatus.output}`,
+    };
+  }
+
+  return { ok: true, output: `Reset ${branch} to ${startRef}.` };
+}
+
 function mergeTargetIntoBranch(project: SandcastleProject, cwd: string): VerifyResult {
   sh(`git fetch origin ${shellQuote(project.defaultBranch)}`, { cwd, allowFailure: true });
   const output = sh(`git merge --no-edit ${shellQuote(`origin/${project.defaultBranch}`)}`, { cwd, allowFailure: true });
@@ -2515,7 +2633,12 @@ async function implementParentPrd(parent: CandidateIssue, workspace: string, bas
       return { parent, commits: totalCommits };
     }
 
-    ensureLocalBranchFromRemote(workspace, branch);
+    const prepareBranch = preparePrdBranchForSlice(project, workspace, branch);
+    if (!prepareBranch.ok) {
+      blockPrdWorkflow(project, parent, `aiops could not start Slice Issue #${slice.iid} from a clean latest-origin PRD branch.\n\n\`\`\`text\n${prepareBranch.output.slice(-12000)}\n\`\`\``, { slice, removeLabels: [PRD_IMPLEMENT_LABEL] });
+      return { parent, commits: totalCommits };
+    }
+
     const sandbox = await sandcastle.createSandbox({
       cwd: workspace,
       branch,
@@ -2525,9 +2648,9 @@ async function implementParentPrd(parent: CandidateIssue, workspace: string, bas
     });
 
     try {
-      const mergeRemote = mergeRemoteBranchIntoBranch(sandbox.worktreePath, branch);
-      if (!mergeRemote.ok) {
-        blockPrdWorkflow(project, parent, `aiops could not safely merge the remote PRD branch before implementing Slice Issue #${slice.iid}.\n\n\`\`\`text\n${mergeRemote.output.slice(-12000)}\n\`\`\``, { slice, removeLabels: [PRD_IMPLEMENT_LABEL] });
+      const resetStart = resetCleanWorktreeToLatestOrigin(project, sandbox.worktreePath, branch);
+      if (!resetStart.ok) {
+        blockPrdWorkflow(project, parent, `aiops could not start Slice Issue #${slice.iid} from a clean latest-origin PRD branch.\n\n\`\`\`text\n${resetStart.output.slice(-12000)}\n\`\`\``, { slice, removeLabels: [PRD_IMPLEMENT_LABEL] });
         return { parent, commits: totalCommits };
       }
 

@@ -14,6 +14,7 @@ This repo is safe to publish publicly: organization-specific project allowlists 
 - Normal standalone issues require `ready-for-agent`.
 - High-risk standalone issues should require `ready-for-agent` and `agent-approved`.
 - PRD workflow uses ordinary Parent PRD issues and ordinary Slice Issues linked by aiops markers.
+- Before each Slice Issue implementation, syncs the shared PRD branch from latest origin state and refuses to start with local worktree changes.
 - High-risk Parent PRDs require `agent-approved` in addition to `agent-to-issues` or `agent-implement-prd`.
 - Opens GitLab MRs or GitHub PRs for human review; never auto-merges.
 - On MR/PR creation, removes `ready-for-agent` and adds `agent-mr-opened`.
