@@ -24,3 +24,15 @@ _Avoid_: Child work item, sub-issue, task
 
 **Blocked PRD Workflow**:
 A PRD Workflow state where aiops cannot safely continue without human intervention.
+
+**Review Comment**:
+An unresolved code-review thread on a Review Request from a human reviewer or Automated Review Service.
+_Avoid_: Top-level comment, resolved comment, system note
+
+**Automated Review Service**:
+A configured non-human reviewer whose code-review comments may be considered during a Review Comment Fix Pass.
+_Avoid_: Bot, CI job, scanner
+
+**Review Comment Fix Pass**:
+A human-triggered aiops run that addresses Review Comments on an existing PRD Workflow Review Request with focused changes on the same branch.
+_Avoid_: MR fix pass, review cleanup

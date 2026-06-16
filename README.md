@@ -76,6 +76,14 @@ npm run sandcastle:implement-prd
 
 The PRD implementation run keeps taking the next valid Slice Issue for each selected Parent PRD until the PRD is complete, a slice is blocked, verification fails, or the safety iteration cap is reached. The PRD workflow opens one draft MR/PR after the first implemented slice, keeps updating that same Review Request, and marks it `agent-ready-for-review` when all slices are implemented.
 
+To ask Sandcastle to address unresolved Review Comments on a non-draft PRD Workflow Review Request, label the Review Request `agent-fix-review-comments`, then run:
+
+```bash
+npm run sandcastle:fix-review-comments
+```
+
+The Review Comment Fix Pass reads unresolved review threads, makes focused local commits on the existing branch, runs verification, pushes only if verification passes, replies to handled threads without resolving them, and removes `agent-fix-review-comments` only when all eligible Review Comments are handled. Configure `reviewCommentFix.automatedReviewers` per project to allow automated review services to be considered.
+
 To ask Sandcastle to inspect failed GitLab CI pipelines / GitHub checks or resolve MR/PR merge conflicts and push focused fixes, use a non-draft MR/PR labelled `agent-created` and/or `agent-fix-ci`, then run:
 
 ```bash
@@ -92,6 +100,7 @@ Create these labels in managed repositories before using PRD workflow:
 - `agent-implement-prd` — implement the next Slice Issue for a Parent PRD.
 - `agent-prd-in-progress` — a shared PRD Review Request exists or is being worked.
 - `agent-ready-for-review` — all slices are implemented and the shared Review Request is ready.
+- `agent-fix-review-comments` — request a Review Comment Fix Pass for a ready PRD Workflow Review Request.
 - `agent-blocked` — aiops cannot safely continue without human intervention.
 - `agent-slice` — marks ordinary issues created as Slice Issues.
 - `agent-slice-implemented` — marks a Slice Issue implemented on the shared branch.

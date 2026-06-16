@@ -188,6 +188,55 @@ type FailedGitHubReviewRequest = {
 
 type FailedReviewRequest = FailedGitLabReviewRequest | FailedGitHubReviewRequest;
 
+type ReviewCommentSource = "human" | "automated";
+type ReviewCommentFixStatus = "fixed" | "skipped" | "unfixed";
+
+type ReviewCommentNote = {
+  id: string;
+  body: string;
+  author?: string;
+  authorIsBot?: boolean;
+  createdAt?: string;
+  system?: boolean;
+  url?: string;
+};
+
+type ReviewComment = {
+  forge: Forge;
+  threadId: string;
+  source: ReviewCommentSource;
+  notes: ReviewCommentNote[];
+  authorLogins: string[];
+  path?: string;
+  line?: number;
+  diffHunk?: string;
+  url?: string;
+};
+
+type ReviewCommentFixCandidate = {
+  forge: Forge;
+  project: SandcastleProject;
+  rr: ReviewRequest;
+  raw: GitLabMergeRequest | GitHubPullRequest;
+};
+
+type ReviewCommentFixReportThread = {
+  id?: unknown;
+  status?: unknown;
+  reason?: unknown;
+};
+
+type ReviewCommentFixReport = {
+  summary?: unknown;
+  threads?: unknown;
+};
+
+type NormalizedReviewCommentFixOutcome = {
+  id: string;
+  status: ReviewCommentFixStatus;
+  reason: string;
+};
+
 type SlicePlan = {
   title: string;
   body: string;
@@ -217,6 +266,7 @@ const builtSandboxImages = new Set<string>();
 const AGENT_MR_LABEL = "agent-created";
 const AGENT_CREATED_LABEL = AGENT_MR_LABEL;
 const CI_FIX_LABEL = "agent-fix-ci";
+const REVIEW_COMMENT_FIX_LABEL = "agent-fix-review-comments";
 const PRD_TO_ISSUES_LABEL = "agent-to-issues";
 const PRD_IMPLEMENT_LABEL = "agent-implement-prd";
 const PRD_IN_PROGRESS_LABEL = "agent-prd-in-progress";
@@ -234,6 +284,10 @@ const PRD_SLICES_START = "<!-- aiops-prd-slices-start -->";
 const PRD_SLICES_END = "<!-- aiops-prd-slices-end -->";
 const PRD_REVIEW_START = "<!-- aiops-prd-review-start -->";
 const PRD_REVIEW_END = "<!-- aiops-prd-review-end -->";
+const REVIEW_COMMENT_FIX_MARKER_NAME = "aiops-review-comment-fix";
+const REVIEW_COMMENT_FIX_HANDLED_MARKER = /<!--\s*aiops-review-comment-fix:\s*(addressed|skipped)\s*-->/i;
+const REVIEW_COMMENT_FIX_REPORT_PATH = ".aiops/review-comment-fix-report.json";
+const MAX_REVIEW_COMMENT_PROMPT_BYTES = 48 * 1024;
 const ELIGIBLE_CI_FIX_MR_LABELS = [AGENT_MR_LABEL, CI_FIX_LABEL];
 const FAILED_GITHUB_CHECK_BUCKETS = new Set(["fail"]);
 const FAILED_GITHUB_RUN_CONCLUSIONS = new Set(["failure", "timed_out", "startup_failure"]);
@@ -295,6 +349,11 @@ function parseRepoHost(repo: string): string | undefined {
 
 function projectHost(project: SandcastleProject): string | undefined {
   return parseRepoHost(project.repo) ?? parseRemoteHost(project.remoteUrl);
+}
+
+function githubApiHostArg(project: SandcastleProject): string {
+  const host = projectHost(project);
+  return host ? ` --hostname ${shellQuote(host)}` : "";
 }
 
 function currentWorkflowAuthor(project: SandcastleProject): string | undefined {
@@ -1415,6 +1474,26 @@ function addReviewRequestLabels(project: SandcastleProject, rr: ReviewRequest, l
   sh(command);
 }
 
+function removeReviewRequestLabels(project: SandcastleProject, rr: ReviewRequest, labels: string[]): void {
+  if (labels.length === 0) return;
+  const joined = labels.join(",");
+  if (rr.forge === "github") {
+    sh(`gh pr edit ${shellQuote(String(rr.id))} -R ${shellQuote(project.repo)} --remove-label ${shellQuote(joined)}`, { allowFailure: true });
+  } else {
+    sh(`glab api projects/${gitlabProjectPath(project.repo)}/merge_requests/${rr.id} -X PUT -f ${shellQuote(`remove_labels=${joined}`)} --silent`, { allowFailure: true });
+  }
+}
+
+function addReviewRequestComment(project: SandcastleProject, rr: ReviewRequest, body: string): void {
+  withTempFile(body, (path) => {
+    if (rr.forge === "github") {
+      sh(`gh pr comment ${shellQuote(String(rr.id))} -R ${shellQuote(project.repo)} --body-file ${shellQuote(path)}`);
+    } else {
+      sh(`glab api projects/${gitlabProjectPath(project.repo)}/merge_requests/${rr.id}/notes -X POST -F ${shellQuote(`body=@${path}`)} --silent`);
+    }
+  });
+}
+
 function updateReviewRequestBody(project: SandcastleProject, rr: ReviewRequest, body: string): void {
   withTempFile(body, (path) => {
     if (rr.forge === "github") {
@@ -1535,6 +1614,417 @@ function getMergeRequest(project: SandcastleProject, iid: number): GitLabMergeRe
 
 function mrHasConflicts(mr: GitLabMergeRequest): boolean {
   return mr.has_conflicts === true || [mr.detailed_merge_status, mr.merge_status].includes("conflict");
+}
+
+type GitLabDiscussionNote = {
+  id: number;
+  body?: string;
+  type?: string;
+  system?: boolean;
+  resolvable?: boolean;
+  resolved?: boolean;
+  created_at?: string;
+  author?: { username?: string; name?: string; bot?: boolean };
+  position?: { new_path?: string; old_path?: string; new_line?: number; old_line?: number };
+};
+
+type GitLabDiscussion = {
+  id: string;
+  notes?: GitLabDiscussionNote[];
+};
+
+type GitHubReviewThreadNode = {
+  id: string;
+  isResolved?: boolean;
+  path?: string;
+  line?: number;
+  startLine?: number;
+  originalLine?: number;
+  comments?: {
+    nodes?: Array<{
+      id: string;
+      body?: string;
+      createdAt?: string;
+      url?: string;
+      diffHunk?: string;
+      author?: { login?: string; __typename?: string };
+    }>;
+  };
+};
+
+type GitHubReviewThreadsResponse = {
+  data?: {
+    repository?: {
+      pullRequest?: {
+        reviewThreads?: {
+          nodes?: GitHubReviewThreadNode[];
+          pageInfo?: { hasNextPage?: boolean };
+        };
+      };
+    };
+  };
+};
+
+function automatedReviewerSet(project: SandcastleProject): Set<string> {
+  return new Set((project.reviewCommentFix?.automatedReviewers ?? []).map((author) => author.toLowerCase()));
+}
+
+function authorLogins(notes: ReviewCommentNote[]): string[] {
+  return [...new Set(notes.map((note) => note.author).filter((author): author is string => Boolean(author)))].sort();
+}
+
+function reviewCommentSource(project: SandcastleProject, notes: ReviewCommentNote[]): ReviewCommentSource | undefined {
+  const automated = automatedReviewerSet(project);
+  const meaningful = notes.filter((note) => !note.system && note.body.trim().length > 0);
+  const eligible = meaningful.filter((note) => {
+    const login = note.author?.toLowerCase();
+    const configuredAutomated = Boolean(login && automated.has(login));
+    if (configuredAutomated) return true;
+    return note.authorIsBot !== true;
+  });
+  if (eligible.length === 0) return undefined;
+
+  const hasHuman = eligible.some((note) => {
+    const login = note.author?.toLowerCase();
+    return !(login && automated.has(login)) && note.authorIsBot !== true;
+  });
+  return hasHuman ? "human" : "automated";
+}
+
+function reviewCommentThreadAlreadyHandled(notes: ReviewCommentNote[]): boolean {
+  let markerIndex = -1;
+  for (const [index, note] of notes.entries()) {
+    if (REVIEW_COMMENT_FIX_HANDLED_MARKER.test(note.body)) markerIndex = index;
+  }
+  if (markerIndex < 0) return false;
+  return notes.slice(markerIndex + 1).every((note) => note.system || REVIEW_COMMENT_FIX_HANDLED_MARKER.test(note.body));
+}
+
+function gitlabNoteToReviewCommentNote(note: GitLabDiscussionNote): ReviewCommentNote {
+  return {
+    id: String(note.id),
+    body: note.body ?? "",
+    author: note.author?.username ?? note.author?.name,
+    authorIsBot: note.author?.bot === true,
+    createdAt: note.created_at,
+    system: note.system === true,
+  };
+}
+
+function gitlabDiscussionIsUnresolvedCodeReview(discussion: GitLabDiscussion): boolean {
+  const notes = discussion.notes ?? [];
+  const resolvable = notes.filter((note) => note.resolvable === true || note.type === "DiffNote" || Boolean(note.position));
+  return resolvable.length > 0 && resolvable.some((note) => note.resolved !== true);
+}
+
+function gitlabDiscussionToReviewComment(project: SandcastleProject, discussion: GitLabDiscussion): ReviewComment | undefined {
+  if (!gitlabDiscussionIsUnresolvedCodeReview(discussion)) return undefined;
+  const notes = (discussion.notes ?? []).map(gitlabNoteToReviewCommentNote);
+  if (reviewCommentThreadAlreadyHandled(notes)) return undefined;
+  const source = reviewCommentSource(project, notes);
+  if (!source) return undefined;
+
+  const positioned = (discussion.notes ?? []).find((note) => note.position)?.position;
+  return {
+    forge: "gitlab",
+    threadId: discussion.id,
+    source,
+    notes,
+    authorLogins: authorLogins(notes),
+    path: positioned?.new_path ?? positioned?.old_path,
+    line: positioned?.new_line ?? positioned?.old_line,
+  };
+}
+
+function listGitLabReviewComments(project: SandcastleProject, rr: ReviewRequest): ReviewComment[] {
+  const raw = sh(`glab api projects/${gitlabProjectPath(project.repo)}/merge_requests/${rr.id}/discussions?per_page=100`, { allowFailure: true });
+  if (commandFailed(raw)) throw new Error(`Could not list GitLab review discussions for ${project.repo}!${rr.id}:\n${raw}`);
+  return parseJsonArray<GitLabDiscussion>(raw)
+    .map((discussion) => gitlabDiscussionToReviewComment(project, discussion))
+    .filter((comment): comment is ReviewComment => Boolean(comment));
+}
+
+function githubRepoParts(project: SandcastleProject): { owner: string; name: string } | undefined {
+  const parts = project.repo.split("/").filter(Boolean);
+  const owner = parts.at(-2);
+  const name = parts.at(-1);
+  return owner && name ? { owner, name } : undefined;
+}
+
+function githubThreadToReviewComment(project: SandcastleProject, thread: GitHubReviewThreadNode): ReviewComment | undefined {
+  if (thread.isResolved === true) return undefined;
+  const notes = (thread.comments?.nodes ?? []).map((comment) => ({
+    id: comment.id,
+    body: comment.body ?? "",
+    author: comment.author?.login,
+    authorIsBot: comment.author?.__typename === "Bot",
+    createdAt: comment.createdAt,
+    url: comment.url,
+  } satisfies ReviewCommentNote));
+  if (notes.length === 0 || reviewCommentThreadAlreadyHandled(notes)) return undefined;
+  const source = reviewCommentSource(project, notes);
+  if (!source) return undefined;
+
+  return {
+    forge: "github",
+    threadId: thread.id,
+    source,
+    notes,
+    authorLogins: authorLogins(notes),
+    path: thread.path,
+    line: thread.line ?? thread.startLine ?? thread.originalLine,
+    diffHunk: thread.comments?.nodes?.find((comment) => comment.diffHunk)?.diffHunk,
+    url: notes.find((note) => note.url)?.url,
+  };
+}
+
+function listGitHubReviewComments(project: SandcastleProject, rr: ReviewRequest): ReviewComment[] {
+  const repo = githubRepoParts(project);
+  if (!repo) throw new Error(`Could not parse GitHub repository owner/name from ${project.repo}.`);
+  const query = `query($owner: String!, $name: String!, $number: Int!) {
+    repository(owner: $owner, name: $name) {
+      pullRequest(number: $number) {
+        reviewThreads(first: 100) {
+          nodes {
+            id
+            isResolved
+            path
+            line
+            startLine
+            originalLine
+            comments(first: 100) {
+              nodes {
+                id
+                body
+                createdAt
+                url
+                diffHunk
+                author { login __typename }
+              }
+            }
+          }
+          pageInfo { hasNextPage }
+        }
+      }
+    }
+  }`;
+  const raw = sh(
+    `gh api${githubApiHostArg(project)} graphql -F ${shellQuote(`owner=${repo.owner}`)} -F ${shellQuote(`name=${repo.name}`)} -F ${shellQuote(`number=${rr.id}`)} -f ${shellQuote(`query=${query}`)}`,
+    { allowFailure: true },
+  );
+  if (commandFailed(raw)) throw new Error(`Could not list GitHub review threads for ${project.repo}#${rr.id}:\n${raw}`);
+  const parsed = parseJsonObject<GitHubReviewThreadsResponse>(raw);
+  const threads = parsed?.data?.repository?.pullRequest?.reviewThreads;
+  if (threads?.pageInfo?.hasNextPage) throw new Error(`GitHub PR ${project.repo}#${rr.id} has more than 100 review threads; refusing to partially process them.`);
+  return (threads?.nodes ?? [])
+    .map((thread) => githubThreadToReviewComment(project, thread))
+    .filter((comment): comment is ReviewComment => Boolean(comment));
+}
+
+function listReviewComments(project: SandcastleProject, rr: ReviewRequest): ReviewComment[] {
+  return rr.forge === "github" ? listGitHubReviewComments(project, rr) : listGitLabReviewComments(project, rr);
+}
+
+function reviewCommentLocation(comment: ReviewComment): string {
+  if (!comment.path) return "unknown location";
+  return comment.line ? `${comment.path}:${comment.line}` : comment.path;
+}
+
+function markdownFence(language: string, body: string): string {
+  const longestBackticks = Math.max(2, ...[...body.matchAll(/`+/g)].map((match) => match[0].length));
+  const fence = "`".repeat(longestBackticks + 1);
+  return [`${fence}${language}`, body, fence].join("\n");
+}
+
+function reviewCommentPromptText(comments: ReviewComment[]): string {
+  return comments.map((comment, index) => {
+    const notes = comment.notes
+      .filter((note) => !note.system)
+      .map((note, noteIndex) => [
+        `### Note ${noteIndex + 1}`,
+        note.author ? `Author: ${note.author}${note.authorIsBot ? " (bot)" : ""}` : "Author: unknown",
+        note.createdAt ? `Created: ${note.createdAt}` : undefined,
+        note.url ? `URL: ${note.url}` : undefined,
+        "",
+        markdownFence("md", note.body),
+      ].filter(Boolean).join("\n"))
+      .join("\n\n");
+
+    return [
+      `## Thread ${index + 1}`,
+      `THREAD_ID: ${comment.threadId}`,
+      `Source: ${comment.source === "automated" ? "Automated Review Service" : "Human reviewer"}`,
+      `Authors: ${comment.authorLogins.join(", ") || "unknown"}`,
+      `Location: ${reviewCommentLocation(comment)}`,
+      comment.url ? `URL: ${comment.url}` : undefined,
+      comment.diffHunk ? ["Diff hunk:", markdownFence("diff", comment.diffHunk)].join("\n") : undefined,
+      "",
+      notes,
+    ].filter(Boolean).join("\n");
+  }).join("\n\n");
+}
+
+function addReviewCommentThreadReply(project: SandcastleProject, rr: ReviewRequest, comment: ReviewComment, body: string): void {
+  withTempFile(body, (path) => {
+    if (rr.forge === "github") {
+      const mutation = `mutation($threadId: ID!, $body: String!) {
+        addPullRequestReviewThreadReply(input: { pullRequestReviewThreadId: $threadId, body: $body }) {
+          comment { id url }
+        }
+      }`;
+      sh(`gh api${githubApiHostArg(project)} graphql -f ${shellQuote(`query=${mutation}`)} -F ${shellQuote(`threadId=${comment.threadId}`)} -F ${shellQuote(`body=@${path}`)} --silent`);
+    } else {
+      sh(`glab api projects/${gitlabProjectPath(project.repo)}/merge_requests/${rr.id}/discussions/${comment.threadId}/notes -X POST -F ${shellQuote(`body=@${path}`)} --silent`);
+    }
+  });
+}
+
+function reviewCommentFixPromptTooLarge(text: string): boolean {
+  return Buffer.byteLength(text, "utf8") > MAX_REVIEW_COMMENT_PROMPT_BYTES;
+}
+
+function normalizeReviewCommentFixReport(report: ReviewCommentFixReport | undefined, comments: ReviewComment[], commitCount: number): NormalizedReviewCommentFixOutcome[] {
+  const expected = new Map(comments.map((comment) => [comment.threadId, comment]));
+  const reported = Array.isArray(report?.threads) ? report.threads as ReviewCommentFixReportThread[] : [];
+  const outcomes = new Map<string, NormalizedReviewCommentFixOutcome>();
+
+  for (const item of reported) {
+    const id = typeof item.id === "string" ? item.id : "";
+    if (!expected.has(id) || outcomes.has(id)) continue;
+    const rawStatus = typeof item.status === "string" ? item.status.toLowerCase() : "";
+    const rawReason = typeof item.reason === "string" ? item.reason.trim() : "";
+    let status: ReviewCommentFixStatus = rawStatus === "fixed" || rawStatus === "skipped" || rawStatus === "unfixed" ? rawStatus : "unfixed";
+    let reason = rawReason;
+
+    const comment = expected.get(id)!;
+    if (status === "skipped" && comment.source !== "automated") {
+      status = "unfixed";
+      reason = "aiops reported this human Review Comment as skipped, but skipping is only allowed for Automated Review Service comments.";
+    }
+    if (status === "fixed" && commitCount === 0) {
+      status = "unfixed";
+      reason = "aiops reported this Review Comment as fixed but made no commit.";
+    }
+    if (status !== "fixed" && !reason) reason = status === "skipped" ? "aiops intentionally made no code change for this automated-review comment." : "aiops could not safely address this Review Comment.";
+    if (rawStatus && status === "unfixed" && rawStatus !== "unfixed" && !reason) reason = `aiops reported invalid status: ${rawStatus}`;
+
+    outcomes.set(id, { id, status, reason });
+  }
+
+  for (const comment of comments) {
+    if (!outcomes.has(comment.threadId)) {
+      outcomes.set(comment.threadId, {
+        id: comment.threadId,
+        status: "unfixed",
+        reason: "aiops did not report an outcome for this Review Comment.",
+      });
+    }
+  }
+
+  return comments.map((comment) => outcomes.get(comment.threadId)!);
+}
+
+function cleanupReviewCommentFixReport(cwd: string): void {
+  rmSync(join(cwd, REVIEW_COMMENT_FIX_REPORT_PATH), { force: true });
+}
+
+function reviewCommentFixReportCommitted(cwd: string): boolean {
+  const output = sh(`git ls-tree -r --name-only HEAD -- ${shellQuote(REVIEW_COMMENT_FIX_REPORT_PATH)}`, { cwd, allowFailure: true });
+  return output.split(/\r?\n/).includes(REVIEW_COMMENT_FIX_REPORT_PATH);
+}
+
+function reviewCommentOutcomeHandled(comment: ReviewComment, outcome: NormalizedReviewCommentFixOutcome): boolean {
+  if (outcome.status === "fixed") return true;
+  return outcome.status === "skipped" && comment.source === "automated";
+}
+
+function reviewCommentFixCounts(comments: ReviewComment[], outcomes: NormalizedReviewCommentFixOutcome[]) {
+  const byId = new Map(comments.map((comment) => [comment.threadId, comment]));
+  return outcomes.reduce((counts, outcome) => {
+    counts[outcome.status] += 1;
+    const comment = byId.get(outcome.id);
+    if (comment && !reviewCommentOutcomeHandled(comment, outcome)) counts.unhandled += 1;
+    return counts;
+  }, { fixed: 0, skipped: 0, unfixed: 0, unhandled: 0 } as Record<ReviewCommentFixStatus | "unhandled", number>);
+}
+
+function reviewCommentThreadReply(outcome: NormalizedReviewCommentFixOutcome): string {
+  if (outcome.status === "fixed") {
+    return [`<!-- ${REVIEW_COMMENT_FIX_MARKER_NAME}: addressed -->`, "Addressed in latest aiops fix pass; leaving unresolved for reviewer confirmation."].join("\n");
+  }
+  if (outcome.status === "skipped") {
+    return [`<!-- ${REVIEW_COMMENT_FIX_MARKER_NAME}: skipped -->`, `Not changed: ${outcome.reason}; leaving unresolved for reviewer confirmation.`].join("\n");
+  }
+  return `Not changed: ${outcome.reason}; leaving unresolved for reviewer confirmation.`;
+}
+
+function addReviewCommentReplies(project: SandcastleProject, rr: ReviewRequest, comments: ReviewComment[], outcomes: NormalizedReviewCommentFixOutcome[]): void {
+  const byId = new Map(comments.map((comment) => [comment.threadId, comment]));
+  for (const outcome of outcomes) {
+    const comment = byId.get(outcome.id);
+    if (!comment) continue;
+    try {
+      addReviewCommentThreadReply(project, rr, comment, reviewCommentThreadReply(outcome));
+    } catch (error) {
+      console.error(failure(`Could not reply to Review Comment ${outcome.id} on ${reviewRequestDisplayRef(project, rr)}:`), error);
+    }
+  }
+}
+
+function reviewCommentFixSummaryBody(options: { outcomes: NormalizedReviewCommentFixOutcome[]; comments: ReviewComment[]; commitCount: number; verify?: VerifyResult; pushed: boolean; allHandled: boolean }): string {
+  const counts = reviewCommentFixCounts(options.comments, options.outcomes);
+  return [
+    "aiops completed a Review Comment Fix Pass.",
+    "",
+    `- Fixed: ${counts.fixed}`,
+    `- Skipped automated-review comments: ${counts.skipped}`,
+    `- Not fixed: ${counts.unfixed}`,
+    `- Commits pushed: ${options.pushed ? options.commitCount : 0}`,
+    options.verify ? `- Verification: ${options.verify.ok ? "passed" : "failed"}` : undefined,
+    `- Trigger label: ${options.allHandled ? "removed" : "kept because at least one Review Comment is not handled"}`,
+    "",
+    "Review threads were left unresolved for reviewer confirmation.",
+    options.outcomes.some((outcome) => outcome.status !== "fixed") ? [
+      "",
+      "Per-thread outcomes:",
+      ...options.outcomes.map((outcome) => `- ${outcome.id}: ${outcome.status}${outcome.reason ? ` — ${outcome.reason}` : ""}`),
+    ].join("\n") : undefined,
+  ].filter(Boolean).join("\n");
+}
+
+function reviewCommentFixFailureBody(title: string, details: string): string {
+  return [
+    `aiops could not complete the Review Comment Fix Pass: ${title}`,
+    "",
+    "No changes were pushed. The trigger label was kept for follow-up.",
+    "",
+    "```text",
+    details.slice(-12000),
+    "```",
+  ].join("\n");
+}
+
+function reviewCommentFixNoCommentsBody(): string {
+  return [
+    "aiops found no eligible unresolved Review Comments to address.",
+    "",
+    `Removed \`${REVIEW_COMMENT_FIX_LABEL}\` because the request was handled as a no-op.`,
+  ].join("\n");
+}
+
+function saveReviewCommentFixArtifacts(cwd: string, branch: string, reviewRequestRefValue: string, verifyOutput: string): { patchPath: string; logPath: string } {
+  const dir = join(process.cwd(), ".aiops", "patches");
+  mkdirSync(dir, { recursive: true });
+  sh(`git fetch origin ${shellQuote(`${branch}:refs/remotes/origin/${branch}`)}`, { cwd, allowFailure: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const base = `${dockerImageSlug(reviewRequestRefValue)}-${stamp}`;
+  const patchPath = join(dir, `${base}.patch`);
+  const logPath = join(dir, `${base}.verify.log`);
+  const patch = sh(`git format-patch --stdout ${shellQuote(`origin/${branch}..HEAD`)}`, { cwd, allowFailure: true });
+  writeFileSync(patchPath, patch);
+  writeFileSync(logPath, verifyOutput);
+  console.log(color.yellow(`Saved Review Comment Fix Pass artifacts locally: ${patchPath}, ${logPath}`));
+  return { patchPath, logPath };
 }
 
 function gitlabProjectPath(repo: string): string {
@@ -2153,6 +2643,227 @@ async function runImplementPrd() {
   }
 }
 
+function reviewRequestDisplayRef(project: SandcastleProject, rr: ReviewRequest): string {
+  return rr.forge === "gitlab" ? `${project.repo}!${rr.id}` : `${project.repo}#${rr.id}`;
+}
+
+function reviewRequestIsOpen(rr: ReviewRequest): boolean {
+  return ["open", "opened"].includes(rr.state.toLowerCase());
+}
+
+function isReviewCommentFixCandidate(rr: ReviewRequest): boolean {
+  return reviewRequestIsOpen(rr)
+    && !rr.draft
+    && rr.labels.includes(AGENT_CREATED_LABEL)
+    && rr.labels.includes(PRD_READY_FOR_REVIEW_LABEL)
+    && rr.labels.includes(REVIEW_COMMENT_FIX_LABEL)
+    && Boolean(parseParentRef(rr.body));
+}
+
+function listReviewCommentFixCandidates(selectedProjects: SandcastleProject[]): ReviewCommentFixCandidate[] {
+  return selectedProjects.filter(prdWorkflowEnabled).flatMap((project): ReviewCommentFixCandidate[] => {
+    if (projectForge(project) === "github") {
+      return listOpenPullRequests(project)
+        .filter((pr) => !pr.isCrossRepository)
+        .map((pr) => ({ forge: "github" as const, project, rr: githubReviewRequest(pr), raw: pr }))
+        .filter((item) => isReviewCommentFixCandidate(item.rr));
+    }
+
+    return listOpenMergeRequests(project)
+      .map((mr) => getMergeRequest(project, mr.iid) ?? mr)
+      .map((mr) => ({ forge: "gitlab" as const, project, rr: gitlabReviewRequest(project, mr), raw: mr }))
+      .filter((item) => isReviewCommentFixCandidate(item.rr));
+  });
+}
+
+function reviewCommentFixConflictSummary(item: ReviewCommentFixCandidate, workspace: string): string {
+  if (item.forge === "gitlab") {
+    const mr = item.raw as GitLabMergeRequest;
+    return mrHasConflicts(mr) ? conflictSummary(item.project, mr, workspace).slice(-12000) : "MR is not currently reported as conflicted.";
+  }
+
+  const pr = item.raw as GitHubPullRequest;
+  return prHasConflicts(pr) ? githubConflictSummary(item.project, pr, workspace).slice(-12000) : "PR is not currently reported as conflicted.";
+}
+
+function readValidReviewCommentFixReport(cwd: string): ReviewCommentFixReport | undefined {
+  const path = join(cwd, REVIEW_COMMENT_FIX_REPORT_PATH);
+  if (!existsSync(path)) return undefined;
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as ReviewCommentFixReport : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+type ReviewCommentFixWorkItem = {
+  candidate: ReviewCommentFixCandidate;
+  comments: ReviewComment[];
+  reviewCommentsText: string;
+};
+
+function reviewCommentFixPromptArgs(item: ReviewCommentFixWorkItem, conflicts: string): Record<string, string> {
+  const { candidate, reviewCommentsText } = item;
+  return {
+    REPO: candidate.project.repo,
+    REVIEW_REQUEST_REF: reviewRequestDisplayRef(candidate.project, candidate.rr),
+    REVIEW_REQUEST_TITLE: candidate.rr.title,
+    REVIEW_REQUEST_URL: candidate.rr.url ?? reviewRequestDisplayRef(candidate.project, candidate.rr),
+    PARENT_PRD_REF: parseParentRef(candidate.rr.body) ?? "unknown Parent PRD",
+    BRANCH: candidate.rr.branch,
+    MR_TARGET_BRANCH: candidate.rr.targetBranch,
+    REVIEW_COMMENTS: reviewCommentsText,
+    REVIEW_REQUEST_BODY: candidate.rr.body.slice(-12000),
+    CONFLICT_SUMMARY: conflicts,
+    SETUP_COMMANDS: commandList(candidate.project.setupCommands),
+    VERIFY_COMMANDS: commandList(candidate.project.verifyCommands),
+    REPORT_PATH: REVIEW_COMMENT_FIX_REPORT_PATH,
+  };
+}
+
+async function fixReviewComments(item: ReviewCommentFixWorkItem, workspace: string): Promise<{ ref: string; commits: number; allHandled: boolean }> {
+  const { candidate, comments } = item;
+  const { project, rr } = candidate;
+  const ref = reviewRequestDisplayRef(project, rr);
+  const conflicts = reviewCommentFixConflictSummary(candidate, workspace);
+
+  ensureLocalBranchFromRemote(workspace, rr.branch);
+  const sandbox = await sandcastle.createSandbox({
+    cwd: workspace,
+    branch: rr.branch,
+    baseBranch: rr.targetBranch,
+    sandbox: sandboxProvider(project),
+    hooks: sandboxHooks(project),
+  });
+
+  try {
+    const mergeRemote = mergeRemoteBranchIntoBranch(sandbox.worktreePath, rr.branch);
+    if (!mergeRemote.ok) {
+      addReviewRequestComment(project, rr, reviewCommentFixFailureBody("could not sync the remote Review Request branch", mergeRemote.output));
+      return { ref, commits: 0, allHandled: false };
+    }
+
+    const result = await sandbox.run({
+      name: `${workspaceName(project.repo)}-${rr.forge === "github" ? "pr" : "mr"}-${rr.id}-review-comment-fixer`,
+      maxIterations: 80,
+      idleTimeoutSeconds: 1800,
+      agent: AGENT,
+      promptFile: join(PROMPT_DIR, "fix-review-comments-prompt.md"),
+      promptArgs: reviewCommentFixPromptArgs(item, conflicts),
+    });
+
+    const commitCount = result.commits.length;
+    const report = readValidReviewCommentFixReport(sandbox.worktreePath);
+    if (!report || !Array.isArray(report.threads)) {
+      if (commitCount > 0) saveReviewCommentFixArtifacts(sandbox.worktreePath, rr.branch, ref, "aiops did not write a valid review-comment fix report; changes were not pushed.");
+      addReviewRequestComment(project, rr, reviewCommentFixFailureBody("agent did not write a valid review-comment fix report", `Expected ${REVIEW_COMMENT_FIX_REPORT_PATH} with a threads array.`));
+      return { ref, commits: 0, allHandled: false };
+    }
+
+    const outcomes = normalizeReviewCommentFixReport(report, comments, commitCount);
+    if (commitCount > 0 && outcomes.every((outcome) => outcome.status !== "fixed")) {
+      saveReviewCommentFixArtifacts(sandbox.worktreePath, rr.branch, ref, "aiops made commits but did not report any Review Comment as fixed; changes were not pushed.");
+      addReviewRequestComment(project, rr, reviewCommentFixFailureBody("agent made commits without reporting a fixed Review Comment", "The local changes were preserved as a patch artifact on the runner."));
+      return { ref, commits: 0, allHandled: false };
+    }
+
+    const reportCommitted = reviewCommentFixReportCommitted(sandbox.worktreePath);
+    cleanupReviewCommentFixReport(sandbox.worktreePath);
+    if (reportCommitted) {
+      if (commitCount > 0) saveReviewCommentFixArtifacts(sandbox.worktreePath, rr.branch, ref, "aiops committed its local report file; changes were not pushed.");
+      addReviewRequestComment(project, rr, reviewCommentFixFailureBody("agent committed its local report file", `${REVIEW_COMMENT_FIX_REPORT_PATH} must not be committed.`));
+      return { ref, commits: 0, allHandled: false };
+    }
+
+    let verify: VerifyResult | undefined;
+    let pushed = false;
+    if (commitCount > 0) {
+      verify = await runSandboxVerify(project, sandbox, `${workspaceName(project.repo)}-${rr.forge === "github" ? "pr" : "mr"}-${rr.id}-review-comment-verify`);
+      if (!verify.ok) {
+        saveReviewCommentFixArtifacts(sandbox.worktreePath, rr.branch, ref, verify.output);
+        addReviewRequestComment(project, rr, reviewCommentFixFailureBody("verification failed", verify.output));
+        return { ref, commits: 0, allHandled: false };
+      }
+
+      const push = pushBranch(sandbox.worktreePath, rr.branch);
+      if (!push.ok) {
+        saveReviewCommentFixArtifacts(sandbox.worktreePath, rr.branch, ref, push.output);
+        addReviewRequestComment(project, rr, reviewCommentFixFailureBody("push failed", push.output));
+        return { ref, commits: 0, allHandled: false };
+      }
+      pushed = true;
+    }
+
+    const byId = new Map(comments.map((comment) => [comment.threadId, comment]));
+    const allHandled = outcomes.every((outcome) => {
+      const comment = byId.get(outcome.id);
+      return comment ? reviewCommentOutcomeHandled(comment, outcome) : false;
+    });
+
+    addReviewCommentReplies(project, rr, comments, outcomes);
+    try {
+      addReviewRequestComment(project, rr, reviewCommentFixSummaryBody({ outcomes, comments, commitCount, verify, pushed, allHandled }));
+    } catch (error) {
+      console.error(failure(`Could not add Review Comment Fix Pass summary to ${ref}:`), error);
+    }
+    if (allHandled) removeReviewRequestLabels(project, rr, [REVIEW_COMMENT_FIX_LABEL]);
+
+    return { ref, commits: pushed ? commitCount : 0, allHandled };
+  } finally {
+    await sandbox.close();
+  }
+}
+
+async function runReviewCommentFixPasses() {
+  const candidates = listReviewCommentFixCandidates(projects).slice(0, MAX_ISSUES_PER_RUN);
+  const workItems: ReviewCommentFixWorkItem[] = [];
+
+  for (const candidate of candidates) {
+    const ref = reviewRequestDisplayRef(candidate.project, candidate.rr);
+    let comments: ReviewComment[];
+    try {
+      comments = listReviewComments(candidate.project, candidate.rr);
+    } catch (error) {
+      addReviewRequestComment(candidate.project, candidate.rr, reviewCommentFixFailureBody("could not read Review Comments", String(error instanceof Error ? error.stack ?? error.message : error)));
+      continue;
+    }
+
+    if (comments.length === 0) {
+      addReviewRequestComment(candidate.project, candidate.rr, reviewCommentFixNoCommentsBody());
+      removeReviewRequestLabels(candidate.project, candidate.rr, [REVIEW_COMMENT_FIX_LABEL]);
+      console.log(success(`✓ ${ref}: no eligible unresolved Review Comments`));
+      continue;
+    }
+
+    const reviewCommentsText = reviewCommentPromptText(comments);
+    if (reviewCommentFixPromptTooLarge(reviewCommentsText)) {
+      addReviewRequestComment(candidate.project, candidate.rr, reviewCommentFixFailureBody("too many or too-large Review Comments", `Review Comment prompt payload is ${Buffer.byteLength(reviewCommentsText, "utf8")} bytes; max is ${MAX_REVIEW_COMMENT_PROMPT_BYTES}.`));
+      continue;
+    }
+
+    workItems.push({ candidate, comments, reviewCommentsText });
+  }
+
+  const workspaces = prepareWorkspaces(workItems.map((item) => item.candidate.project));
+
+  console.log(`\n${heading(`Selected ${workItems.length} Review Request(s) for Review Comment Fix Pass:`)}`);
+  for (const item of workItems) {
+    console.log(`- ${color.cyan(reviewRequestDisplayRef(item.candidate.project, item.candidate.rr))}: ${item.candidate.rr.title} ${color.dim(`(${item.comments.length} Review Comment(s))`)}`);
+  }
+
+  const settled = await Promise.allSettled(
+    workItems.map((item) => fixReviewComments(item, workspaces.get(item.candidate.project.repo)!)),
+  );
+
+  for (const [i, outcome] of settled.entries()) {
+    const item = workItems[i]!;
+    const ref = reviewRequestDisplayRef(item.candidate.project, item.candidate.rr);
+    if (outcome.status === "rejected") console.error(failure(`✗ ${ref} failed:`), outcome.reason);
+    else console.log(success(`✓ ${ref}: ${outcome.value.commits} pushed commit(s), all handled: ${outcome.value.allHandled}`));
+  }
+}
+
 function listFailedGitLabReviewRequests(selectedProjects: SandcastleProject[]): FailedGitLabReviewRequest[] {
   return selectedProjects.flatMap((project) =>
     listOpenMergeRequests(project)
@@ -2355,6 +3066,7 @@ const mode = process.argv[2] ?? "issues";
 if (mode === "issues") await runIssues();
 else if (mode === "to-issues-prd") await runToIssuesPrd();
 else if (mode === "implement-prd") await runImplementPrd();
+else if (mode === "fix-review-comments") await runReviewCommentFixPasses();
 else if (mode === "fix-failed-review-requests") await runFailedReviewRequests();
 else if (mode === "build-sandbox-images") runBuildSandboxImages();
 else throw new Error(`Unknown mode: ${mode}`);

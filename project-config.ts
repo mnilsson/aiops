@@ -7,6 +7,11 @@ export type ProjectRisk = "normal" | "high";
 export type BaselineMode = "local" | "gitlab-quality";
 export type AuthorScope = "self" | "any";
 
+export type ReviewCommentFixConfig = {
+  /** Automated reviewer usernames/logins whose review threads may be considered during review-comment fix passes. */
+  automatedReviewers?: string[];
+};
+
 export type SandboxBaseImageFromRepo = {
   /** Relative path to the repo Dockerfile to build from. Defaults to "Dockerfile". */
   dockerfile?: string;
@@ -42,6 +47,8 @@ export type SandcastleProject = {
   baselineMode?: BaselineMode;
   /** Defaults to true. Disable for repos whose tracker/API behavior is not compatible with PRD workflow. */
   prdWorkflow?: boolean;
+  /** Review Comment Fix Pass behavior for this project. */
+  reviewCommentFix?: ReviewCommentFixConfig;
   /** Explicit prebuilt sandbox image. Takes precedence over sandboxBaseImageFromRepo. */
   sandboxImage?: string;
   /** Build a project-specific sandbox image from a trusted repo Dockerfile/stage. */
